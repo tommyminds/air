@@ -26,6 +26,7 @@ type Engine struct {
 	debugMode bool
 	runArgs   []string
 	running   atomic.Bool
+	debouncer *time.Timer
 
 	eventCh        chan string
 	watcherStopCh  chan bool
@@ -344,8 +345,13 @@ func (e *Engine) start() {
 
 			// cannot set buildDelay to 0, because when the write multiple events received in short time
 			// it will start Multiple buildRuns: https://github.com/air-verse/air/issues/473
-			time.Sleep(e.config.buildDelay())
-			e.flushEvents()
+			e.withLock(func() {
+				if e.debouncer != nil {
+					e.debouncer.Reset(e.config.buildDelay())
+				} else {
+					e.debouncer = time.AfterFunc(e.config.buildDelay(), e.triggerBuildRun)
+				}
+			})
 
 			if e.config.Screen.ClearOnRebuild {
 				if e.config.Screen.KeepScroll {
@@ -359,21 +365,28 @@ func (e *Engine) start() {
 
 			e.mainLog("%s has changed", e.config.rel(filename))
 		case <-firstRunCh:
-			// go down
+			e.triggerBuildRun()
 		}
-
-		// already build and run now
-		select {
-		case <-e.buildRunCh:
-			e.buildRunStopCh <- true
-		default:
-		}
-
-		// if current app is running, stop it
-		e.stopBin()
-
-		go e.buildRun()
 	}
+}
+
+func (e *Engine) triggerBuildRun() {
+	// already build and run now
+	select {
+	case <-e.buildRunCh:
+		e.buildRunStopCh <- true
+	default:
+	}
+
+	// if current app is running, stop it
+	e.stopBin()
+
+	go e.buildRun()
+
+	// reset debouncer
+	e.withLock(func() {
+		e.debouncer = nil
+	})
 }
 
 func (e *Engine) buildRun() {
@@ -422,17 +435,6 @@ func (e *Engine) buildRun() {
 	}
 	if err = e.runBin(); err != nil {
 		e.runnerLog("failed to run, error: %s", err.Error())
-	}
-}
-
-func (e *Engine) flushEvents() {
-	for {
-		select {
-		case <-e.eventCh:
-			e.mainDebug("flushing events")
-		default:
-			return
-		}
 	}
 }
 
@@ -575,7 +577,6 @@ func (e *Engine) runBin() error {
 
 	e.runnerLog("running...")
 	go func() {
-
 		defer func() {
 			select {
 			case <-e.exitCh:
